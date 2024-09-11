@@ -1,14 +1,14 @@
 model:
-  name: emoskd
+  name: emoksd
   arch: roberta
   framework: 
   scale: large
-  drop_rate: 0.1
+  drop_rate: 0.3
   use_adapter: false
   use_lora: true
   use_rnn: false 
   optim_sched: ['AdamW', 'cosine']
-  weight: 1.0
+  weight: 0.5
 
 train:
   device_ids: [0]

@@ -45,7 +45,7 @@ def run(args):
             'bz':      args.train['batch_size'],
             'dr':      args.model['drop_rate'],
             'seed':    args.train['seed'],
-            # 'ekl':     args.model['ekl'],
+            'weight':  args.model['weight'],
         },
         'metric': {
             'stop':    result['valid']['epoch'],
@@ -76,21 +76,3 @@ if __name__ == '__main__':
             args.train['seed'] = seed
             record = run(args)
             record_show.write(record, space=False) 
-
-
-    # seeds = []
-    # if seeds or args.train['inference']: # 按指定 seed 执行
-    #     if not seeds: seeds = [args.train['seed']]
-    #     recoed_path = f"{args.file['record']}{args.model['name']}_best.jsonl"
-    #     record_show = JsonFile(recoed_path, mode_w='a', delete=True)
-    #     for seed in seeds:
-    #         args.train['seed'] = seed
-    #         record = run(args)
-    #         record_show.write(record, space=False) 
-    # else: # 随机 seed 执行       
-    #     recoed_path = f"{args.file['record']}{args.model['name']}_search.jsonl"
-    #     record_show = JsonFile(recoed_path, mode_w='a', delete=True)
-    #     for c in range(100):
-    #         args.train['seed'] = random.randint(1000,9999)+c
-    #         record = run(args)
-    #         record_show.write(record, space=False)

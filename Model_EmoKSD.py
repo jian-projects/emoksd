@@ -1,4 +1,5 @@
 import torch, os, json
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -11,13 +12,13 @@ from transformers import logging
 logging.set_verbosity_error()
 
 from utils_model import *
-# from utils_rnn import DynamicLSTM
+from utils_rnn import DynamicLSTM
 # config 中已经添加路径了
 from data_loader import ERCDataset_Multi
 
-max_seq_lens = {'meld': 128, 'iec': 512}
+max_seq_lens = {'meld': 127, 'iec': 511, 'emn': 127}
 
-class ERCDataset_EmoSKD(ERCDataset_Multi):
+class ERCDataset_EmoKSD(ERCDataset_Multi):
     """
     每个utt, 拼接之前若干个utt(带mask表emo), 作为一个样本
     通过 mlm 预测mask位置的单词, 来学习情绪流
@@ -143,7 +144,6 @@ def config_for_model(args, scale='base'):
     
     args.model['data'] = f"{args.file['cache_dir']}{args.model['name']}.{scale}"
 
-
     return args
              
 def import_model(args):
@@ -151,15 +151,16 @@ def import_model(args):
     args = config_for_model(args) # 添加模型参数, 获取任务数据集
     
     ## 2. 导入数据
+    max_seq_len = args.model['max_seq_len'] if 'max_seq_len' in args.model else max_seq_lens[args.train['tasks'][-1]]
     data_path = args.model['data']
     if os.path.exists(data_path):
         dataset = torch.load(data_path)
     else:
         data_dir = f"{args.file['data_dir']}{args.train['tasks'][-1]}/"
-        dataset = ERCDataset_EmoSKD(data_dir, args.train['batch_size'])
+        dataset = ERCDataset_EmoKSD(data_dir, args.train['batch_size'])
         tokenizer = AutoTokenizer.from_pretrained(args.model['plm'])      
-        dataset.setup(tokenizer, max_seq_len=max_seq_lens[args.train['tasks'][-1]])
-        torch.save(dataset, data_path)
+        dataset.setup(tokenizer, max_seq_len=max_seq_len)
+        # torch.save(dataset, data_path)
     
     dataset.batch_cols = {
         'index': -1,
@@ -168,9 +169,12 @@ def import_model(args):
         'input_ids_t': dataset.tokenizer.pad_token_id, 
         'attention_mask': 0, 
         'attention_mask_t': 0, 
+        # 'cur_mask': 0,
+        # 'emo_flow_token_ids': -1,   # token id
+        # 'emo_flow_token_label': -1, # token category
     }
 
-    model = EmoSKD(
+    model = EmoKSD(
         args=args,
         dataset=dataset,
         plm=args.model['plm'],
@@ -178,7 +182,7 @@ def import_model(args):
     return model, dataset
 
 
-class EmoSKD(ModelForClassification):
+class EmoKSD(ModelForClassification):
     def __init__(self, args, dataset, plm=None):
         super().__init__() # 能继承 ModelForClassification 的属性
         self.args = args
@@ -216,8 +220,6 @@ class EmoSKD(ModelForClassification):
             output_hidden_states=True,
             return_dict=True
         )
-        outputs['student_layer'] = [self.plm_model.pooler(h) for h in outputs['student'].hidden_states]
-
         if stage == 'train':
             with torch.no_grad():
                 outputs['teacher'] = encode_model(
@@ -226,36 +228,39 @@ class EmoSKD(ModelForClassification):
                     output_hidden_states=True,
                     return_dict=True
                 )
-            outputs['teacher_layer'] = [self.plm_model.pooler(h) for h in outputs['teacher'].hidden_states]
 
         outputs['mask_token_bool'] = inputs['input_ids']==self.mask_token_id
-        outputs['student_features'] = outputs['student'].pooler_output
         return outputs
+    
         
     def forward(self, inputs, stage='train'):
         ## 1. encoding 
-        encode_outputs = self.encode(inputs, stage=stage)
-        features = self.dropout(encode_outputs['student_features'])
+        outputs = self.encode(inputs, stage=stage)
+        features = self.dropout(outputs['student'].pooler_output)
         logits = self.classifier(features)
         preds = torch.argmax(logits, dim=-1).cpu()
         loss = self.loss_ce(logits, inputs['label'])
 
         ## 2. constraints
         if stage=='train':
-            # ###################### Fine Grained ###############################
-            # mask_token_bool = encode_outputs['mask_token_bool']
-            # mask_features = encode_outputs['student'].last_hidden_state[mask_token_bool]
-            # emo_features = encode_outputs['teacher'].last_hidden_state[mask_token_bool]
-            # loss_ekd = F.l1_loss(mask_features, emo_features)
-            # ###################################################################
-
-            ###################### Coarse Grained ###############################
-            mask_features = encode_outputs['student'].pooler_output
-            emo_features = encode_outputs['teacher'].pooler_output
-            loss_ekd = F.l1_loss(mask_features, emo_features)
+            ###################### Fine Grained ###############################
+            mask_token_bool = outputs['mask_token_bool']
+            mask_features = outputs['student'].last_hidden_state[mask_token_bool]
+            emo_features = outputs['teacher'].last_hidden_state[mask_token_bool]
+            loss_td = F.l1_loss(mask_features, emo_features)
             ###################################################################
 
-            loss += loss_ekd * self.weight
+            ###################### Coarse Grained ###############################
+            mask_feature = outputs['student'].pooler_output
+            emo_feature = outputs['teacher'].pooler_output
+            loss_ud = F.l1_loss(mask_feature, emo_feature)
+            ###################################################################
+
+            # loss = (1-self.weight)*loss + self.weight*(loss_ud+loss_td)
+            if 'weight_' in self.args.model:
+                loss = loss + self.weight*(self.args.model['weight_'][0]*loss_ud+self.args.model['weight_'][1]*loss_td)
+            else:
+                loss = loss + self.weight*(loss_ud+loss_td)
 
         mask = inputs['label'] >= 0
         return {
@@ -266,3 +271,49 @@ class EmoSKD(ModelForClassification):
             'labels': inputs['label'][mask],
         }
     
+    def get_constraints(self, inputs, constraints=['ekd']):
+        outputs, bz = {}, len(inputs['mask_token_ids'])
+        mask_token_bool, mask_token_ids = inputs['mask_token_bool'], inputs['mask_token_ids']
+        layer_mask_features = torch.stack(inputs['student_layer'])[self.layers][:, mask_token_bool]
+        layer_emo_features = torch.stack(inputs['teacher_layer'])[self.layers][:, mask_token_bool]
+        
+        # 1.0 teacher emo 蒸馏到 student mask 上
+        if 'ekd' in constraints:  
+            loss_ekd = [F.l1_loss(m_fea, e_fea) for m_fea, e_fea in zip(layer_mask_features, layer_emo_features)]
+            outputs['loss_ekd'] = sum([r*l for r,l in zip(self.l_rate, loss_ekd)])
+        
+        # 2.0 构建原型, 执行对比学习
+        if 'eka' in constraints:
+            emo_token_ids = mask_token_ids[mask_token_ids >= 0] # emo token ids for each layer
+            existing_category = e_c = emo_token_ids.unique()
+            layer_proto = torch.stack([layer_emo_features[:,emo_token_ids==c].mean(dim=1) for c in e_c]).transpose(0,1)
+
+            e2p_label = torch.stack([e_c==l for l in emo_token_ids])
+            loss_eka = [proto_cl(e, p, e2p_label) for e, p in zip(layer_mask_features, layer_proto)]
+            outputs['loss_eka'] = sum([r*l for r,l in zip(self.l_rate, loss_eka)])
+
+        # 3.0 稳固情绪流, 增强分类器稳定性
+        if 'ekp' in constraints:
+            mask_token_label_pad = inputs['mask_token_label']
+            mask_token_label = mask_token_label_pad[mask_token_ids>=0] # 展开所有sample中存在的 mask token 的标签 
+            assert len(mask_token_label) == layer_emo_features.shape[1]
+            layer_logits = [torch.cat([self.classifier(self.dropout(c)) for c in torch.split(e, bz)]) for e in layer_emo_features]
+            loss_ekp = [self.loss_ce(l, mask_token_label) for l in layer_logits]
+            outputs['loss_ekp'] = sum([r*l for r,l in zip(self.l_rate, loss_ekp)])
+
+        return outputs
+    
+
+def proto_cl(embedding, proto, label, temp=1.0):
+    """
+    embeddings: 目标向量
+    protos：原型向量
+    labels：目标相对于原型向量的label, 即目标向量与哪个原型相似
+    """
+    cosine_sim = F.cosine_similarity(embedding.unsqueeze(1), proto.unsqueeze(0), dim=-1) / temp
+    cosine_sim_exp = torch.exp(cosine_sim)
+
+    # 每个 embedding, 最接近其所属原型
+    loss = -torch.cat([torch.log(sim[lab]/sum(sim)) for sim, lab in zip(cosine_sim_exp, label)]).mean()
+    
+    return loss
